@@ -72,6 +72,10 @@ check_environment() {
     if [ -e /.flatpak-info ]; then
         flatpak=1
     fi
+
+    home="$HOME"
+    [ -z "$home" ] && home=~
+    home="$(realpath "$home")"
 }
 
 verchk() {
@@ -167,6 +171,35 @@ setup_wine() {
     wineprefix="$WINEPREFIX"
 }
 
+steamrt_checkpath() {
+    valid_basedirs="
+        /media
+        /mnt
+        /run/media
+        /home
+        /opt
+        /srv
+        /var/tmp
+        /tmp
+"
+
+    dirs=""
+    for valid_base in "$home" $valid_basedirs ; do
+        [ ! -e "$valid_base" ] && continue;
+        if [[ "$spout2pw" == "$valid_base"/* ]]; then
+            return 0
+        fi
+        dirs="$dirs$valid_base "
+    done
+
+    fatal \
+"Spout2PW is installed at $spout2pw. This is incompatible with Steam Runtime.
+Please move Spout2PW such that the full path starts with one of the following directories:
+
+$dirs
+"
+}
+
 setup_umu() {
     umu="$1"
     if [ -z "$PROTONPATH" ]; then
@@ -191,15 +224,16 @@ setup_umu() {
     done
 
     if [ "$UMU_NO_RUNTIME" != 1 ]; then
+        steamrt_checkpath
         gbm_steamrt_workaround "$runtimepath"
     fi
 
     if [ -n "$WINEPREFIX" ]; then
         wineprefix="$WINEPREFIX"
     elif [ -n "$GAMEID" ]; then
-        wineprefix="$HOME/Games/umu/$GAMEID/"
+        wineprefix="$home/Games/umu/$GAMEID/"
     else
-        wineprefix="$HOME/Games/umu/umu-default/"
+        wineprefix="$home/Games/umu/umu-default/"
     fi
 
     run_in_prefix() {
@@ -234,6 +268,7 @@ setup_steam() {
 
     if [[ ! "$1" == */proton ]] && [ "$steam_runtime" = 1 ]; then
         runtimepath="$(echo "$STEAM_COMPAT_TOOL_PATHS" | cut -d: -f2)"
+        steamrt_checkpath
         gbm_steamrt_workaround "$runtimepath"
     fi
 

@@ -606,12 +606,15 @@ static NTSTATUS create_source(void *args) {
     allocInfo.commandBufferCount = 1;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 
+    pthread_mutex_lock(&vk_lock);
     CHECK_VK_RESULT(
         vkAllocateCommandBuffers(device, &allocInfo, &source->commandBuffer)) {
+        pthread_mutex_unlock(&vk_lock);
         ERROR_MSG("Failed to allocate Vulkan command buffer");
         ret = -EIO;
         goto free_source;
     }
+    pthread_mutex_unlock(&vk_lock);
 
     ret = funnel_stream_create(funnel, params->sender_name, &stream);
     if (ret) {
@@ -677,7 +680,9 @@ static NTSTATUS create_source(void *args) {
 free_stream:
     funnel_stream_destroy(stream);
 free_cmdbufs:
+    pthread_mutex_lock(&vk_lock);
     vkFreeCommandBuffers(device, commandPool, 1, &source->commandBuffer);
+    pthread_mutex_unlock(&vk_lock);
 free_source:
     free(source);
     return errno_to_status(-ret);
@@ -1120,7 +1125,6 @@ static NTSTATUS run_source(void *args) {
         }
     }
 
-
     TRACE("run_source(): Exiting, wait for idle\n");
 
     pthread_mutex_lock(&vk_lock);
@@ -1143,7 +1147,9 @@ static NTSTATUS run_source(void *args) {
 
     TRACE("run_source(): Freeing command buffers\n");
 
+    pthread_mutex_lock(&vk_lock);
     vkFreeCommandBuffers(device, commandPool, 1, &source->commandBuffer);
+    pthread_mutex_unlock(&vk_lock);
 
     source->dead = true;
 

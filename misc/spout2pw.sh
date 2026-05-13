@@ -396,21 +396,16 @@ prepare_prefix() {
 
 prepare_proton() {
     if ! grep -q 'WINEDLLPATH.*in os.environ' "$protonpath/proton"; then
-        fatal "This Proton version is too old to work with Spout2PW.\n\nSpout2PW requires a recent Proton 10."
+        fatal "This Proton version is too old to work with Spout2PW.\n\nSpout2PW requires Proton 10 or newer."
     fi
 
     version="$(grep "^;; Version:" "$protonpath/files/share/wine/wine.inf" | cut -d: -f2 | sed -e 's/^ *//' -e 's/ *$//')"
-    version="${version%%}"
     log "Wine version: '$version'"
 
-    case "$version" in
-        "Wine 10."*)
-        ;;
-        *)
-            fatal "Unsupported Wine/Proton version: $version.\n\nSpout2PW currently requires Proton 10."
-        ;;
-    esac
-
+    major="$(printf '%s\n' "$version" | sed -nE 's/^Wine ([0-9]+).*/\1/p')"
+    if [ -z "$major" ] || [ "$major" -lt 10 ]; then
+        fatal "Unsupported Wine/Proton version: $version.\n\nSpout2PW requires Proton 10 or newer."
+    fi
 }
 
 setup_env() {

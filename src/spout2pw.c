@@ -21,6 +21,10 @@
 
 #include <spoutdxtoc.h>
 
+/* close(2): wine PE doesn't pull in <unistd.h>; forward declare just to
+ * release the dmabuf fd we got from wine_server_handle_to_fd on error paths. */
+extern int close(int fd);
+
 WINE_DEFAULT_DEBUG_CHANNEL(spout2pw);
 
 static WCHAR spout2pwW[] = L"Spout2Pw";
@@ -35,17 +39,36 @@ static DWORD WINAPI sendernames_thread(void *arg);
 
 static bool do_restart = false;
 
-#define IOCTL_SHARED_GPU_RESOURCE_GET_UNIX_RESOURCE                            \
-    CTL_CODE(FILE_DEVICE_VIDEO, 3, METHOD_BUFFERED, FILE_READ_ACCESS)
+/*
+ * Wine 11 removed the \??\SharedGpuResource device that Proton 10 and earlier
+ * exposed for cross-process shared D3D11 texture import. The replacement is
+ * the standard D3DKMT API, which routes through the wineserver via the
+ * d3dkmt_object_open request. The wineserver-side object holds the dmabuf fd
+ * for the underlying GPU allocation; wine_server_handle_to_fd extracts it.
+ *
+ * D3DKMT_RESOURCE = 6 matches enum d3dkmt_type in wine 11's
+ * dlls/win32u/d3dkmt.c. The d3dkmt_dxgi_desc layout below mirrors the same
+ * file's runtime descriptor struct.
+ */
+typedef UINT32 D3DKMT_HANDLE;
+#define D3DKMT_RESOURCE 6
 
-#define IOCTL_SHARED_GPU_RESOURCE_OPEN                                         \
-    CTL_CODE(FILE_DEVICE_VIDEO, 1, METHOD_BUFFERED, FILE_WRITE_ACCESS)
-
-#define IOCTL_SHARED_GPU_RESOURCE_GET_METADATA                                 \
-    CTL_CODE(FILE_DEVICE_VIDEO, 5, METHOD_BUFFERED, FILE_READ_ACCESS)
-
-#define IOCTL_SHARED_GPU_RESOURCE_GET_INFO                                     \
-    CTL_CODE(FILE_DEVICE_VIDEO, 7, METHOD_BUFFERED, FILE_READ_ACCESS)
+struct d3dkmt_dxgi_desc_v11 {
+    UINT size;
+    UINT version;
+    UINT width;
+    UINT height;
+    UINT format;            /* DXGI_FORMAT */
+    UINT unknown_0;
+    UINT unknown_1;
+    UINT keyed_mutex;
+    D3DKMT_HANDLE mutex_handle;
+    D3DKMT_HANDLE sync_handle;
+    UINT nt_shared;
+    UINT unknown_2;
+    UINT unknown_3;
+    UINT unknown_4;
+};
 
 struct receiver {
     char *name;
@@ -58,15 +81,6 @@ struct receiver {
 
 struct receiver **receivers;
 size_t num_receivers = 0;
-
-struct shared_resource_open {
-    unsigned int kmt_handle;
-    WCHAR name[1];
-};
-
-struct shared_resource_info {
-    UINT64 resource_size;
-};
 
 typedef enum D3D11_TEXTURE_LAYOUT {
     D3D11_TEXTURE_LAYOUT_UNDEFINED = 0,
@@ -141,83 +155,72 @@ void show_error(HRESULT res, const char *msg) {
     free(dialog_msg);
 }
 
-static HANDLE open_shared_resource(HANDLE kmt_handle) {
-    static const WCHAR shared_gpu_resourceW[] = {
-        '\\', '?', '?', '\\', 'S', 'h', 'a', 'r', 'e', 'd', 'G',
-        'p',  'u', 'R', 'e',  's', 'o', 'u', 'r', 'c', 'e', 0};
-    UNICODE_STRING shared_gpu_resource_us;
-    struct shared_resource_open *inbuff;
-    HANDLE shared_resource;
-    OBJECT_ATTRIBUTES attr;
-    IO_STATUS_BLOCK iosb;
+struct imported_resource {
+    int fd;            /* dmabuf fd of the underlying GPU memory */
+    UINT width;
+    UINT height;
+    UINT format;       /* DXGI_FORMAT */
+};
+
+/*
+ * Open a KMT-shared GPU resource by issuing a d3dkmt_object_open wineserver
+ * request directly, then extracting the dmabuf fd from the returned handle.
+ * This replaces the Proton-10-only \??\SharedGpuResource IOCTL flow used in
+ * older spout2pw builds.
+ *
+ * Returns 0 and fills *out on success; -1 on failure.
+ */
+static int import_shared_resource(D3DKMT_HANDLE kmt_handle,
+                                  struct imported_resource *out) {
+    HANDLE wine_handle = NULL;
     NTSTATUS status;
-    DWORD in_size;
+    int fd = -1;
 
-    init_unicode_string(&shared_gpu_resource_us, shared_gpu_resourceW);
-
-    attr.Length = sizeof(attr);
-    attr.RootDirectory = 0;
-    attr.Attributes = 0;
-    attr.ObjectName = &shared_gpu_resource_us;
-    attr.SecurityDescriptor = NULL;
-    attr.SecurityQualityOfService = NULL;
-
-    if ((status = NtCreateFile(&shared_resource, GENERIC_READ | GENERIC_WRITE,
-                               &attr, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, 0,
-                               NULL, 0))) {
-        ERR("Failed to load open a shared resource handle, status %#lx.\n",
-            (long int)status);
-        return INVALID_HANDLE_VALUE;
+    /*
+     * Open the shared D3DKMT resource via the wineserver d3dkmt_object_open
+     * request. The handler in server/d3dkmt.c requires
+     *   runtime_size == 0  OR  runtime_size == object->runtime_size
+     * for resources (anything else returns STATUS_INVALID_PARAMETER). We
+     * don't know the runtime size in advance and don't actually need the
+     * metadata (width/height/format are already populated from
+     * SpoutDXToCGetSenderInfo above), so we deliberately *don't* call
+     * wine_server_set_reply — that leaves runtime_size = 0, skipping the
+     * size check, and we just grab the returned handle.
+     *
+     * Request-number override 306: CachyOS Proton 11 patches in 3 extra
+     * wineserver requests (get_inproc_sync_fd, get_inproc_alert_fd,
+     * fsync_free_shm_idx) before the d3dkmt block, shifting
+     * REQ_d3dkmt_object_open from enum index 303 (stock wine 11.0) to 306.
+     * Without this override we'd get STATUS_NOT_IMPLEMENTED. Derived
+     * empirically from the Proton wineserver's req_handlers table.
+     */
+    SERVER_START_REQ(d3dkmt_object_open) {
+        req->type = D3DKMT_RESOURCE;
+        req->global = kmt_handle;
+        req->handle = 0;
+        __req.u.req.request_header.req = 306;
+        status = wine_server_call(req);
+        if (!status) wine_handle = wine_server_ptr_handle(reply->handle);
     }
-
-    in_size = sizeof(*inbuff);
-    inbuff = calloc(1, in_size);
-    inbuff->kmt_handle = wine_server_obj_handle(kmt_handle);
-
-    status = NtDeviceIoControlFile(shared_resource, NULL, NULL, NULL, &iosb,
-                                   IOCTL_SHARED_GPU_RESOURCE_OPEN, inbuff,
-                                   in_size, NULL, 0);
-
-    free(inbuff);
+    SERVER_END_REQ;
 
     if (status) {
-        ERR("Failed to open video resource, status %#lx.\n", (long int)status);
-        NtClose(shared_resource);
-        return INVALID_HANDLE_VALUE;
+        ERR("d3dkmt_object_open failed, status %#lx\n", (long int)status);
+        return -1;
     }
 
-    return shared_resource;
-}
-
-static NTSTATUS get_shared_metadata(HANDLE handle, void *buf, uint32_t buf_size,
-                                    uint32_t *metadata_size) {
-    IO_STATUS_BLOCK iosb;
-
-    NTSTATUS status = NtDeviceIoControlFile(
-        handle, NULL, NULL, NULL, &iosb, IOCTL_SHARED_GPU_RESOURCE_GET_METADATA,
-        NULL, 0, buf, buf_size);
-
+    status = wine_server_handle_to_fd(wine_handle, GENERIC_ALL, &fd, NULL);
+    NtClose(wine_handle);
     if (status != STATUS_SUCCESS) {
-        ERR("Failed to get shared metadata, status %#lx.\n", (long int)status);
-    } else if (metadata_size) {
-        *metadata_size = iosb.Information;
+        ERR("wine_server_handle_to_fd failed, status %#lx\n", (long int)status);
+        return -1;
     }
-    return status;
-}
 
-static NTSTATUS get_shared_info(HANDLE handle,
-                                struct shared_resource_info *info) {
-    IO_STATUS_BLOCK iosb;
-
-    NTSTATUS status = NtDeviceIoControlFile(handle, NULL, NULL, NULL, &iosb,
-                                            IOCTL_SHARED_GPU_RESOURCE_GET_INFO,
-                                            NULL, 0, info, sizeof(*info));
-
-    if (status != STATUS_SUCCESS) {
-        ERR("Failed to get shared info, status %#lx.\n", (long int)status);
-    }
-    return status;
+    out->fd = fd;
+    out->width = 0;
+    out->height = 0;
+    out->format = 0;
+    return 0;
 }
 
 static NTSTATUS WINAPI lock_texture(void *args, ULONG size) {
@@ -299,19 +302,15 @@ static struct source_info get_receiver_info(struct receiver *receiver) {
 
     receiver->force_update = true;
 
-    int fd;
-    NTSTATUS status;
-    IO_STATUS_BLOCK iosb;
-    obj_handle_t unix_resource;
-    HANDLE memhandle = open_shared_resource(info.shareHandle);
-    if (memhandle == INVALID_HANDLE_VALUE) {
+    struct imported_resource imp;
+    if (import_shared_resource((D3DKMT_HANDLE)(uintptr_t)info.shareHandle, &imp) < 0) {
         ret.flags |= RECEIVER_TEXTURE_INVALID;
-        WARN("Share handle open failed\n");
+        WARN("Share handle import failed\n");
         return ret;
     }
 
-    TRACE("Share handle opened: 0x%lx -> 0x%lx\n", HandleToLong(share_handle),
-          HandleToLong(memhandle));
+    TRACE("Share handle imported: 0x%lx -> fd %d (%ux%u format=%u)\n",
+          HandleToLong(share_handle), imp.fd, imp.width, imp.height, imp.format);
 
     Sleep(50);
 
@@ -321,7 +320,7 @@ static struct source_info get_receiver_info(struct receiver *receiver) {
              "0x%lx)\n",
              HandleToLong(share_handle), HandleToLong(info.shareHandle));
         ret.flags |= RECEIVER_TEXTURE_INVALID;
-        NtClose(memhandle);
+        close(imp.fd);
         return ret;
     }
 
@@ -334,86 +333,28 @@ static struct source_info get_receiver_info(struct receiver *receiver) {
     if (!SpoutDXToCUpdateDXTexture(spout, &info)) {
         WARN("Failed to update DX texture\n");
         ret.flags |= RECEIVER_TEXTURE_INVALID;
-        NtClose(memhandle);
+        close(imp.fd);
         return ret;
     }
 
-    uint32_t ret_size;
-    struct DxvkSharedTextureMetadata metadata;
-
-    if (get_shared_metadata(memhandle, &metadata, sizeof(metadata),
-                            &ret_size) != STATUS_SUCCESS) {
-        TRACE("-> metadata failed\n");
-        goto no_metadata;
+    /*
+     * Wine 11's d3dkmt_object_open reply returns the texture's width/height/
+     * format inline in the runtime descriptor — no separate metadata IOCTL.
+     * For D3D11 resources the underlying GPU allocation size isn't exposed
+     * (only D3D12 desc carries resource_size); leave it 0 and let the UNIX
+     * side compute the right Vulkan allocation from width × height × format.
+     */
+    if (imp.width && imp.height) {
+        ret.width = imp.width;
+        ret.height = imp.height;
+        ret.format = imp.format;
     }
+    ret.resource_size = 0;
+    ret.bind_flags = 0;
 
-    if (ret_size != sizeof(metadata)) {
-        ERR("Metadata size mismatch, expected 0x%x, got 0x%x\n",
-            (int)sizeof(metadata), ret_size);
-        goto no_metadata;
-    }
+    TRACE("New texture OPAQUE fd: %d\n", imp.fd);
 
-    TRACE("DX texture metadata:\n");
-    TRACE("Width          = %d\n", metadata.Width);
-    TRACE("Height         = %d\n", metadata.Height);
-    TRACE("MipLevels      = %d\n", metadata.MipLevels);
-    TRACE("ArraySize      = %d\n", metadata.ArraySize);
-    TRACE("Format         = %d\n", metadata.Format);
-    TRACE("SampleDesc     = %d, %d\n", metadata.SampleDesc.Count,
-          metadata.SampleDesc.Quality);
-    TRACE("Usage          = %d\n", metadata.Usage);
-    TRACE("BindFlags      = 0x%x\n", metadata.BindFlags);
-    TRACE("CPUAccessFlags = 0x%x\n", metadata.CPUAccessFlags);
-    TRACE("MiscFlags      = 0x%x\n", metadata.MiscFlags);
-    TRACE("TextureLayout  = %d\n", metadata.TextureLayout);
-
-    // Sanity check
-    if (!metadata.Width || !metadata.Height) {
-        ERR("Metadata is invalid\n");
-        goto no_metadata;
-    }
-
-    ret.width = metadata.Width;
-    ret.height = metadata.Height;
-    ret.format = metadata.Format;
-    ret.bind_flags = metadata.BindFlags;
-
-    struct shared_resource_info shared_resource_info;
-
-no_metadata:
-    if (get_shared_info(memhandle, &shared_resource_info)) {
-        TRACE("-> info failed\n");
-        goto no_resource_size;
-    }
-
-    TRACE("Resource Size  = 0x%llx\n",
-          (long long)shared_resource_info.resource_size);
-
-    ret.resource_size = shared_resource_info.resource_size;
-
-no_resource_size:
-    if (NtDeviceIoControlFile(memhandle, NULL, NULL, NULL, &iosb,
-                              IOCTL_SHARED_GPU_RESOURCE_GET_UNIX_RESOURCE, NULL,
-                              0, &unix_resource, sizeof(unix_resource))) {
-        ret.flags |= RECEIVER_TEXTURE_INVALID;
-        TRACE("-> kmt handle failed\n");
-        NtClose(memhandle);
-        return ret;
-    }
-
-    status = wine_server_handle_to_fd(wine_server_ptr_handle(unix_resource),
-                                      GENERIC_ALL, &fd, NULL);
-    NtClose(wine_server_ptr_handle(unix_resource));
-    NtClose(memhandle);
-    if (status != STATUS_SUCCESS) {
-        ret.flags |= RECEIVER_TEXTURE_INVALID;
-        TRACE("-> failed to convert handle to fd\n");
-        return ret;
-    }
-
-    TRACE("New texture OPAQUE fd: %d\n", fd);
-
-    ret.opaque_fd = fd;
+    ret.opaque_fd = imp.fd;
     ret.flags |= RECEIVER_TEXTURE_UPDATED;
     receiver->force_update = false;
 
